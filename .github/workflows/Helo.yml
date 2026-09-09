@@ -1,36 +1,204 @@
-# This is a basic workflow to help you get started with Actions
+name: Ubuntu-VPS
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  secure-ssh:
     runs-on: ubuntu-latest
+    timeout-minutes: 3600
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Install Required Packages
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          sudo apt-get update
+          sudo apt-get install -y openssh-server net-tools curl wget ufw
+
+      - name: Configure SSH Server
+        run: |
+          # Enable SSH and configure for password authentication
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          
+          # Configure SSH for password authentication (with security)
+          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+          
+          # Allow SSH port
+          sudo ufw allow 22/tcp || true
+          
+          # Restart SSH service
+          sudo systemctl restart ssh
+
+      - name: Create SSH User with Secure Password
+        run: |
+          # Generate secure password
+          PASSWORD=$(openssl rand -base64 12 | tr -d "=+/" | cut -c1-16)
+          
+          # Create user
+          sudo useradd -m -s /bin/bash vpsuser
+          echo "vpsuser:$PASSWORD" | sudo chpasswd
+          
+          # Add to sudo group
+          sudo usermod -aG sudo vpsuser
+          
+          # Create .ssh directory for future key-based auth
+          sudo mkdir -p /home/vpsuser/.ssh
+          sudo chmod 700 /home/vpsuser/.ssh
+          sudo chown vpsuser:vpsuser /home/vpsuser/.ssh
+          
+          # Store credentials
+          echo "SSH_CREDS=Username: vpsuser | Password: $PASSWORD" >> $GITHUB_ENV
+          echo "SSH_PORT=22" >> $GITHUB_ENV
+          
+          # Verify user creation
+          if ! id "vpsuser" &>/dev/null; then
+              echo "User creation failed"
+              exit 1
+          fi
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Start Tailscale with auth key
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
+          
+          # Wait for Tailscale to assign an IP
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(sudo tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES+1))
+          done
+          
+          if [ -z "$TS_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          
+          # Verify Tailscale is running
+          sudo tailscale status
+
+      - name: Install Additional Tools (Optional)
+        run: |
+          # Install useful tools for the VPS
+          sudo apt-get install -y htop git vim nano neofetch python3 python3-pip build-essential
+          
+          # Install Docker (optional - uncomment if needed)
+          # curl -fsSL https://get.docker.com -o get-docker.sh
+          # sudo sh get-docker.sh
+          # sudo usermod -aG docker vpsuser
+
+      - name: Configure SSH Security
+        run: |
+          # Disable root login
+          sudo sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+          
+          # Set max authentication attempts
+          sudo sed -i 's/^#MaxAuthTries 6/MaxAuthTries 3/' /etc/ssh/sshd_config
+          
+          # Set idle timeout
+          sudo sed -i 's/^#ClientAliveInterval 0/ClientAliveInterval 300/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#ClientAliveCountMax 3/ClientAliveCountMax 2/' /etc/ssh/sshd_config
+          
+          # Restart SSH
+          sudo systemctl restart ssh
+
+      - name: Verify SSH Accessibility
+        run: |
+          echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
+          echo "SSH Port: ${{ env.SSH_PORT }}"
+          
+          # Check if SSH is listening
+          sudo netstat -tlnp | grep :22 || echo "Port 22 not listening"
+          
+          # Test local SSH connection
+          if ! nc -zv localhost 22 2>&1; then
+              echo "Local SSH connection failed"
+              exit 1
+          fi
+          
+          # Test connectivity to Tailscale IP
+          if ! nc -zv ${{ env.TAILSCALE_IP }} 22 2>&1; then
+              echo "SSH connection to Tailscale IP failed"
+              exit 1
+          fi
+          echo "SSH connectivity successful!"
+
+      - name: Display Connection Information
+        run: |
+          echo ""
+          echo "=================================================="
+          echo "=== UBUNTU VPS ACCESS INFORMATION ==="
+          echo "=================================================="
+          echo "SSH Address: ${{ env.TAILSCALE_IP }}"
+          echo "SSH Port: ${{ env.SSH_PORT }}"
+          echo "Username: vpsuser"
+          echo "Password: $(echo ${{ env.SSH_CREDS }} | cut -d'|' -f2 | xargs)"
+          echo "=================================================="
+          echo ""
+          echo "To connect using Termius:"
+          echo "1. Install Tailscale on your local machine"
+          echo "2. Create a new SSH connection in Termius"
+          echo "3. Host: ${{ env.TAILSCALE_IP }}"
+          echo "4. Port: ${{ env.SSH_PORT }}"
+          echo "5. Username: vpsuser"
+          echo "6. Password: Use the password above"
+          echo "7. Save and connect!"
+          echo ""
+          echo "Alternative SSH command:"
+          echo "ssh vpsuser@${{ env.TAILSCALE_IP }} -p ${{ env.SSH_PORT }}"
+          echo ""
+
+      - name: Setup SSH Key Authentication (Optional)
+        run: |
+          # If you want to add your SSH public key for passwordless login
+          # Uncomment and add your SSH public key below
+          # SSH_PUB_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ..."
+          # echo "$SSH_PUB_KEY" | sudo tee -a /home/vpsuser/.ssh/authorized_keys
+          # sudo chmod 600 /home/vpsuser/.ssh/authorized_keys
+          # sudo chown vpsuser:vpsuser /home/vpsuser/.ssh/authorized_keys
+          echo "To add SSH key authentication, uncomment the above section and add your public key"
+
+      - name: Install Additional Features (Optional)
+        run: |
+          # Set up a welcome message
+          echo "Welcome to your GitHub Actions Ubuntu VPS!" | sudo tee /etc/motd
+          echo "IP: ${{ env.TAILSCALE_IP }}" | sudo tee -a /etc/motd
+          echo "User: vpsuser" | sudo tee -a /etc/motd
+          echo "OS: Ubuntu $(lsb_release -rs)" | sudo tee -a /etc/motd
+          
+          # Enable colorful bash prompt
+          echo 'PS1="\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' | sudo tee -a /home/vpsuser/.bashrc
+          
+          # Set up aliases
+          echo "alias ll='ls -la'" | sudo tee -a /home/vpsuser/.bashrc
+          echo "alias update='sudo apt-get update && sudo apt-get upgrade -y'" | sudo tee -a /home/vpsuser/.bashrc
+          
+          sudo chown vpsuser:vpsuser /home/vpsuser/.bashrc
+
+      - name: Maintain Connection
+        run: |
+          echo "SSH VPS Active - Keep runner alive"
+          echo "Press Ctrl+C to terminate workflow"
+          echo ""
+          echo "Use your SSH client (Termius) to connect!"
+          echo ""
+          
+          while true; do
+              echo "[$(date)] SSH VPS Active on ${{ env.TAILSCALE_IP }}:22"
+              echo "  - SSH Status: $(sudo systemctl is-active ssh)"
+              echo "  - Tailscale Status: $(sudo tailscale status --json | grep -o '"Online":true' || echo 'Online: false')"
+              echo "  - Active SSH Connections: $(sudo ss -tn | grep :22 | wc -l)"
+              echo "  - System Load: $(uptime | awk -F'load average:' '{print $2}')"
+              echo "---"
+              sleep 300
+          done
